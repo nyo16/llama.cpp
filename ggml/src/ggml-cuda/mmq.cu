@@ -5,6 +5,20 @@
 
 #include <cstdint>
 
+static __global__ void k_mmq_fold_x_scale(const float * __restrict__ y_scale, const float * __restrict__ x_scale,
+        float * __restrict__ dst, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = (y_scale ? y_scale[i] : 1.0f) * x_scale[0];
+    }
+}
+
+// dst[i] = y_scale[i] * x_scale[0], or x_scale[0] where there is no y_scale
+static void ggml_cuda_mmq_fold_x_scale(const float * y_scale, const float * x_scale, float * dst, const int64_t n, cudaStream_t stream) {
+    const int block_size = 256;
+    k_mmq_fold_x_scale<<<(n + block_size - 1)/block_size, block_size, 0, stream>>>(y_scale, x_scale, dst, n);
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -169,9 +183,16 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
-    const ggml_tensor * gate = fusion ? fusion->gate : nullptr;
+    // Or, with x_scale alone, a per-tensor weight scale (NVFP4's second-level scale) folded into the
+    // per-column y_scale the NVFP4 write-back already applies, instead of a separate MUL over dst.
+    const ggml_tensor * gate    = fusion ? fusion->gate : nullptr;
+    const ggml_tensor * x_scale = fusion && !gate ? fusion->x_scale : nullptr;
     ggml_cuda_mm_fusion_args_device fusion_device = {};
-    if (fusion) {
+    if (x_scale) {
+        GGML_ASSERT(!ids && src0->type == GGML_TYPE_NVFP4);
+        GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias && !fusion->gate_scale);
+        GGML_ASSERT(x_scale->type == GGML_TYPE_F32 && ggml_nelements(x_scale) == 1);
+    } else if (fusion) {
         GGML_ASSERT(gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
         GGML_ASSERT(gate->type == src0->type && ggml_are_same_shape(gate, src0) && ggml_are_same_stride(gate, src0));
         fusion_device.gate      = gate->data;
@@ -226,7 +247,8 @@ void ggml_cuda_mul_mat_q(
 
     // With fusion dst is the GLU output, not a MUL_MAT; the fused types always quantize src1 to Q8_1.
     // TODO support for Q4 precision if both tensors allow it
-    const ggml_prec prec_src1 = gate ? GGML_PREC_Q8 : ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
+    const ggml_tensor * prec_node = fusion && fusion->mm ? fusion->mm : dst;
+    const ggml_prec prec_src1 = gate ? GGML_PREC_Q8 : ggml_cuda_mmq_get_prec_src1(src0, prec_node, cc);
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
@@ -327,9 +349,18 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
+        const float * y_scale = src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale : nullptr;
+        ggml_cuda_pool_alloc<float> y_scale_fused(ctx.pool());
+        if (x_scale) {
+            const int64_t n = ne13*ne12*ne11;
+            y_scale_fused.alloc(n);
+            ggml_cuda_mmq_fold_x_scale(y_scale, (const float *) x_scale->data, y_scale_fused.ptr, n, stream);
+            y_scale = y_scale_fused.ptr;
+        }
+
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1, nullptr, nullptr, dst_d,
-            src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale : nullptr,
+            y_scale,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,

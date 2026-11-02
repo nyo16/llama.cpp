@@ -7808,6 +7808,50 @@ struct test_mul_mat_add : public test_case {
     }
 };
 
+// mul_mat followed by a scalar weight scale, as llama.cpp builds NVFP4 projections (w, w_s):
+// batched so CUDA takes MMQ, which can fold the scale into its write-back
+struct test_mul_mat_scale : public test_case {
+    const ggml_type type_a;
+    const int64_t m, n, k;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+
+    // compare only the final output, so a backend may fuse the MUL into the matmul
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_scale(ggml_type type_a = GGML_TYPE_NVFP4, int64_t m = 256, int64_t n = 64, int64_t k = 512)
+        : type_a(type_a), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(s, "s");
+
+        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(mm, "mm");
+
+        ggml_tensor * out = ggml_mul(ctx, mm, s);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10033,6 +10077,12 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (ggml_type type : { GGML_TYPE_NVFP4, GGML_TYPE_Q4_0 }) {
+        for (int64_t n : { 1, 8, 64, 512 }) {
+            test_cases.emplace_back(new test_mul_mat_scale(type, 256, n, 512));
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
