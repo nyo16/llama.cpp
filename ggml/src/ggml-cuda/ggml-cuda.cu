@@ -4010,6 +4010,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // add_id + the weighted expert reduction: the down projection's expert biases are added inside the
+    // reduction instead of an ADD_ID pass over every expert output
+    if (node->op == GGML_OP_ADD_ID && i + 1 < cgraph->n_nodes && node->type == GGML_TYPE_F32 &&
+            node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) && ggml_are_same_shape(node, node->src[0])) {
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == node) {
+            const int node_count = match.node_count + 1;
+            const int output_idx = i + node_count - 1;
+            std::vector<ggml_op> ops(node_count);
+            for (int j = 0; j < node_count; ++j) {
+                ops[j] = cgraph->nodes[i + j]->op;
+            }
+            if (ggml_can_fuse_subgraph(cgraph, i, node_count, ops.data(), &output_idx, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, node_count, &output_idx, 1)) {
+                ggml_cuda_op_moe_weighted_reduction(
+                    *cuda_ctx, node->src[0], match.expert_scale, match.weights, match.dst, node);
+                return node_count - 1;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -4582,6 +4603,48 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
+
+    // batched mul_mat_id + add_id, mul_mat_id + add_id, glu (gpt-oss experts): the matmuls run as usual
+    // and one kernel adds both expert biases inside the GLU, instead of two ADD_ID passes over the
+    // projections. The vector case is fused into MMVQ above.
+    if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+        const ggml_op ops[5]      = { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_GLU };
+        const int     out_nodes[] = { i + 4 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 5, ops, out_nodes, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1)) {
+            ggml_tensor * mm_a   = cgraph->nodes[i];
+            ggml_tensor * bias_a = cgraph->nodes[i + 1];
+            ggml_tensor * mm_b   = cgraph->nodes[i + 2];
+            ggml_tensor * bias_b = cgraph->nodes[i + 3];
+            ggml_tensor * glu    = cgraph->nodes[i + 4];
+
+            const int  cc       = ggml_cuda_info().devices[cuda_ctx->device].cc;
+            const auto batched  = [cc](const ggml_tensor * mm) {
+                return mm->src[1]->ne[2] > get_mmvq_mmid_max_batch(mm->src[0]->type, cc);
+            };
+            const bool lanes_ok = bias_a->src[0] == mm_a && bias_b->src[0] == mm_b &&
+                ((glu->src[0] == bias_a && glu->src[1] == bias_b) || (glu->src[0] == bias_b && glu->src[1] == bias_a));
+
+            // Both projections stay live until the GLU here, which the allocator does not know: mm_b may
+            // have been given mm_a's memory once mm_a's ADD_ID ran. The GLU writes element i after reading
+            // element i, so it may alias a projection exactly, not at an offset.
+            const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data;
+                const char * b0 = (const char *) b->data;
+                return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+            };
+            const bool alias_ok = !overlap(mm_a, mm_b) &&
+                (!overlap(glu, mm_a) || glu->data == mm_a->data) && (!overlap(glu, mm_b) || glu->data == mm_b->data);
+
+            if (lanes_ok && alias_ok && batched(mm_a) && batched(mm_b) && ggml_cuda_add_id_glu_supported(glu)) {
+                if (!ggml_cuda_compute_forward(*cuda_ctx, mm_a) || !ggml_cuda_compute_forward(*cuda_ctx, mm_b)) {
+                    GGML_ABORT("%s: mul_mat_id failed", __func__);
+                }
+                ggml_cuda_op_add_id_glu(*cuda_ctx, glu);
+                return 4;
+            }
+        }
+    }
 
     // swiglu + NVFP4 mul_mat + optional scale: MMQ quantizes silu(gate) * up itself, so the
     // SWIGLU output is neither written nor read back

@@ -7648,16 +7648,35 @@ struct test_moe_reduce : public test_case {
     const bool unaligned_experts;
     const bool with_expert_scale;
     const bool interleaved_views_adds;
+    const bool with_bias; // the experts are ADD_ID(down projection, expert biases, ids), as in gpt-oss
 
     test_moe_reduce(
             int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
-            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false) :
+            bool unaligned_experts = false, bool with_expert_scale = false, bool interleaved_views_adds = false,
+            bool with_bias = false) :
         n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
         unaligned_experts(unaligned_experts), with_expert_scale(with_expert_scale),
-        interleaved_views_adds(interleaved_views_adds) {}
+        interleaved_views_adds(interleaved_views_adds), with_bias(with_bias) {}
 
     std::string vars() override {
-        return VARS_TO_STR6(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds);
+        return VARS_TO_STR7(n_embd, n_expert_used, n_tokens, unaligned_experts, with_expert_scale, interleaved_views_adds, with_bias);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // distinct experts per token out of 2*n_expert_used
+            std::default_random_engine rng(0);
+            std::vector<int32_t> all(2*n_expert_used);
+            std::iota(all.begin(), all.end(), 0);
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::shuffle(all.begin(), all.end(), rng);
+                ggml_backend_tensor_set(t, all.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7679,6 +7698,14 @@ struct test_moe_reduce : public test_case {
             experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
         }
         ggml_set_name(experts, "experts");
+        if (with_bias) {
+            ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 2*n_expert_used);
+            ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+            ggml_set_name(bias, "bias");
+            ggml_set_name(ids, "ids");
+            experts = ggml_add_id(ctx, experts, bias, ids);
+            ggml_set_name(experts, "biased_experts");
+        }
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
         ggml_set_name(weights, "weights");
 
@@ -12509,6 +12536,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // batched experts with biases on both lanes (gpt-oss): too many tokens for the vector kernels.
+    // Not MXFP4: its native FP4 activations on Blackwell exceed this test's error bound with or without fusion.
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_SWIGLU_OAI}) {
+            for (int64_t m_batch : {64, 256}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 64, 256,
+                    /*use_id =*/ true, 16, 4, /*b =*/ false, /*with_bias =*/ true, /*with_gate =*/ true, /*with_lane_scale =*/ false, {1, 1}));
+            }
+        }
+    }
+
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
@@ -12600,6 +12638,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2880, 4, 64, false, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true, false, true));
+    test_cases.emplace_back(new test_moe_reduce(63,   12, 33, false, true, true, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
