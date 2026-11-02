@@ -1629,6 +1629,8 @@ struct ggml_backend_cuda_context {
 struct ggml_cuda_mm_fusion_args_host {
     // the MUL_MAT node itself when dst is a fused consumer of it: its op params carry the src1 precision
     const ggml_tensor * mm = nullptr;
+    // src1 is this unmaterialized SWIGLU(src[0], src[1]) node: MMQ quantizes silu(gate) * up directly
+    const ggml_tensor * src1_swiglu = nullptr;
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;

@@ -7808,14 +7808,17 @@ struct test_mul_mat_add : public test_case {
     }
 };
 
-// mul_mat followed by a scalar weight scale, as llama.cpp builds NVFP4 projections (w, w_s):
-// batched so CUDA takes MMQ, which can fold the scale into its write-back
+// mul_mat followed by a scalar weight scale, as llama.cpp builds NVFP4 projections (w, w_s), optionally
+// reading a SWIGLU(gate, up) like an FFN down projection: batched so CUDA takes MMQ, which can fold
+// the scale into its write-back and quantize silu(gate) * up without writing the SWIGLU output
 struct test_mul_mat_scale : public test_case {
     const ggml_type type_a;
     const int64_t m, n, k;
+    const bool with_swiglu;
+    const bool with_scale;
 
     std::string vars() override {
-        return VARS_TO_STR4(type_a, m, n, k);
+        return VARS_TO_STR6(type_a, m, n, k, with_swiglu, with_scale);
     }
 
     double max_nmse_err() override {
@@ -7829,25 +7832,38 @@ struct test_mul_mat_scale : public test_case {
         return max_nmse_err();
     }
 
-    // compare only the final output, so a backend may fuse the MUL into the matmul
+    // compare only the final output, so a backend may fuse the SWIGLU and MUL into the matmul
     bool run_whole_graph() override { return true; }
 
-    test_mul_mat_scale(ggml_type type_a = GGML_TYPE_NVFP4, int64_t m = 256, int64_t n = 64, int64_t k = 512)
-        : type_a(type_a), m(m), n(n), k(k) {}
+    test_mul_mat_scale(ggml_type type_a = GGML_TYPE_NVFP4, int64_t m = 256, int64_t n = 64, int64_t k = 512,
+            bool with_swiglu = false, bool with_scale = true)
+        : type_a(type_a), m(m), n(n), k(k), with_swiglu(with_swiglu), with_scale(with_scale) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
-        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         ggml_set_name(a, "a");
+
+        ggml_tensor * b;
+        if (with_swiglu) {
+            ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * up   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(gate, "gate");
+            ggml_set_name(up, "up");
+            b = ggml_swiglu_split(ctx, gate, up);
+        } else {
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        }
         ggml_set_name(b, "b");
-        ggml_set_name(s, "s");
 
-        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
-        ggml_set_name(mm, "mm");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "mm");
 
-        ggml_tensor * out = ggml_mul(ctx, mm, s);
-        ggml_set_name(out, "out");
+        if (with_scale) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(s, "s");
+            out = ggml_mul(ctx, out, s);
+            ggml_set_name(out, "out");
+        }
         return out;
     }
 };
@@ -10078,11 +10094,6 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    for (ggml_type type : { GGML_TYPE_NVFP4, GGML_TYPE_Q4_0 }) {
-        for (int64_t n : { 1, 8, 64, 512 }) {
-            test_cases.emplace_back(new test_mul_mat_scale(type, 256, n, 512));
-        }
-    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -11340,6 +11351,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // a src1 with a nonzero mean, for the zero points and mins of quantized src0 types
         for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
+
+    // an NVFP4 projection's weight scale and an FFN down projection's SWIGLU input, from the vector
+    // kernels to batched MMQ; Q4_0 for a type without NVFP4's fusions
+    for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_Q4_0}) {
+        for (int64_t n : {1, 8, 64, 512}) {
+            for (bool with_swiglu : {false, true}) {
+                for (bool with_scale : {false, true}) {
+                    if (with_swiglu || with_scale) {
+                        test_cases.emplace_back(new test_mul_mat_scale(type_a, 256, n, 512, with_swiglu, with_scale));
+                    }
+                }
+            }
         }
     }
 

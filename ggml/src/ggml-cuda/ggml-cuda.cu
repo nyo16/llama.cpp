@@ -2111,15 +2111,15 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, x_up->ne[1], ncols, nchannels, device);
 }
 
-// Whether mul_mat(src0, src1) * scale can run as one MMQ launch: exactly the case ggml_cuda_mul_mat
-// would hand to MMQ, for an NVFP4 weight with a scalar F32 scale.
+// Whether mul_mat(src0, src1) [* scale] can run as one MMQ launch: exactly the case ggml_cuda_mul_mat
+// would hand to MMQ, for an NVFP4 weight with an optional scalar F32 scale.
 static bool ggml_cuda_should_fuse_mul_mat_q_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * scale) {
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
-    if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
+    if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || ggml_cuda_op_mul_mat_use_fwht(mm)) {
         return false;
     }
-    if (scale->type != GGML_TYPE_F32 || ggml_nelements(scale) != 1 || ggml_cuda_op_mul_mat_use_fwht(mm)) {
+    if (scale && (scale->type != GGML_TYPE_F32 || ggml_nelements(scale) != 1)) {
         return false;
     }
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -2128,6 +2128,27 @@ static bool ggml_cuda_should_fuse_mul_mat_q_scale(ggml_backend_cuda_context & ct
     const int cc   = ggml_cuda_info().devices[ctx.device].cc;
     const int64_t ne11 = src1->ne[1];
     return !ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+}
+
+// Whether mm's src1, the SWIGLU node glu, can be quantized from its gate and up inputs inside that MMQ
+// launch, so the SWIGLU output is never written: needs the native FP4 activation path.
+static bool ggml_cuda_should_fuse_swiglu_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, const ggml_tensor * mm, const ggml_tensor * scale) {
+    if (mm->src[1] != glu || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(gate) || !ggml_is_contiguous(up) || !ggml_is_contiguous(glu) ||
+            !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu)) {
+        return false;
+    }
+    if (!ggml_cuda_should_fuse_mul_mat_q_scale(ctx, mm, scale)) {
+        return false;
+    }
+    return ggml_cuda_mmq_src1_native_fp4(mm, ggml_cuda_info().devices[ctx.device].cc);
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4561,6 +4582,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
+
+    // swiglu + NVFP4 mul_mat + optional scale: MMQ quantizes silu(gate) * up itself, so the
+    // SWIGLU output is neither written nor read back
+    if (cgraph->nodes[i]->op == GGML_OP_GLU) {
+        for (const bool with_scale : { true, false }) {
+            const int     n_ops       = with_scale ? 3 : 2;
+            const ggml_op ops[3]      = { GGML_OP_GLU, GGML_OP_MUL_MAT, GGML_OP_MUL };
+            const int     out_nodes[] = { i + n_ops - 1 };
+            if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) ||
+                    !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+                continue;
+            }
+
+            ggml_tensor * glu      = cgraph->nodes[i];
+            ggml_tensor * mm_node  = cgraph->nodes[i + 1];
+            ggml_tensor * out_node = cgraph->nodes[i + n_ops - 1];
+
+            const ggml_tensor * scale = with_scale ? get_mul_mat_scale(out_node, mm_node) : nullptr;
+            if ((with_scale && !scale) || !ggml_cuda_should_fuse_swiglu_mul_mat_q(*cuda_ctx, glu, mm_node, scale)) {
+                continue;
+            }
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.mm          = mm_node;
+            fusion_data.src1_swiglu = glu;
+            fusion_data.x_scale     = scale;
+            ggml_cuda_mul_mat_q(*cuda_ctx, mm_node->src[0], glu, nullptr, out_node, &fusion_data);
+            return n_ops - 1;
+        }
+    }
 
     // mul_mat + scale + optional bias
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {

@@ -42,6 +42,23 @@ void quantize_mmq_fp4_cuda(const float *   x,
                              int64_t         ne3,
                              cudaStream_t    stream);
 
+// quantize_mmq_fp4_cuda for an NVFP4 matmul whose src1 is SWIGLU(gate, up): quantizes silu(gate) * up
+// without the SWIGLU output being written; gate and up share src1's layout
+void quantize_mmq_nvfp4_swiglu_cuda(const float * gate,
+                                    const float * up,
+                                    void *        vy,
+                                    float *       scale,
+                                    bool          use_aligned_float8,
+                                    int64_t       ne00,
+                                    int64_t       s01,
+                                    int64_t       s02,
+                                    int64_t       s03,
+                                    int64_t       ne0,
+                                    int64_t       ne1,
+                                    int64_t       ne2,
+                                    int64_t       ne3,
+                                    cudaStream_t  stream);
+
 // quantize each token once and scatter the block to its compact rows (via the inverse map)
 void quantize_scatter_mmq_fp4_cuda(const float *   x,
                                    const int32_t * ids_src1_inv,

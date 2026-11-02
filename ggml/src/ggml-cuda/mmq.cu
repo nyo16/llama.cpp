@@ -185,13 +185,16 @@ void ggml_cuda_mul_mat_q(
     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
     // Or, with x_scale alone, a per-tensor weight scale (NVFP4's second-level scale) folded into the
     // per-column y_scale the NVFP4 write-back already applies, instead of a separate MUL over dst.
-    const ggml_tensor * gate    = fusion ? fusion->gate : nullptr;
-    const ggml_tensor * x_scale = fusion && !gate ? fusion->x_scale : nullptr;
+    // An NVFP4 src1 that is SWIGLU(gate, up) can be quantized from gate and up (src1_swiglu), with or without x_scale.
+    const ggml_tensor * gate        = fusion ? fusion->gate : nullptr;
+    const ggml_tensor * x_scale     = fusion && !gate ? fusion->x_scale : nullptr;
+    const ggml_tensor * src1_swiglu = fusion ? fusion->src1_swiglu : nullptr;
     ggml_cuda_mm_fusion_args_device fusion_device = {};
-    if (x_scale) {
-        GGML_ASSERT(!ids && src0->type == GGML_TYPE_NVFP4);
+    if (x_scale || src1_swiglu) {
+        GGML_ASSERT(!ids && !gate && src0->type == GGML_TYPE_NVFP4);
         GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias && !fusion->gate_scale);
-        GGML_ASSERT(x_scale->type == GGML_TYPE_F32 && ggml_nelements(x_scale) == 1);
+        GGML_ASSERT(!x_scale || (x_scale->type == GGML_TYPE_F32 && ggml_nelements(x_scale) == 1));
+        GGML_ASSERT(!src1_swiglu || src1_swiglu == src1);
     } else if (fusion) {
         GGML_ASSERT(gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
         GGML_ASSERT(gate->type == src0->type && ggml_are_same_shape(gate, src0) && ggml_are_same_stride(gate, src0));
@@ -287,9 +290,11 @@ void ggml_cuda_mul_mat_q(
         // ds layout src0's type asks for (the native FP4 layouts differ per FP4 type)
         const int src1_format = use_native_fp4 ? 1000 + (int) src0->type : (int) mmq_get_q8_1_ds_layout(src0->type);
 
-        // only on the main stream: the concurrent-streams path interleaves matmuls across streams
+        // only on the main stream: the concurrent-streams path interleaves matmuls across streams.
+        // A fused SWIGLU src1 is never written, so its address must not key the cache.
         ggml_cuda_mmq_src1_cache & cache = ctx.mmq_src1_cache;
-        const bool use_cache = ctx.curr_stream_no == 0;
+        const bool use_cache = ctx.curr_stream_no == 0 && !src1_swiglu;
+        GGML_ASSERT(!src1_swiglu || use_native_fp4);
 
         ggml_cuda_pool_alloc<char>  src1_q8_1_tmp(ctx.pool());
         ggml_cuda_pool_alloc<float> src1_scale_tmp(ctx.pool());
@@ -331,10 +336,18 @@ void ggml_cuda_mul_mat_q(
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (use_native_fp4) {
                 static constexpr size_t align_float8 = 32;
-                const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1, src1_scale, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
-                                        ne11, ne12, ne13, stream);
+                if (src1_swiglu) {
+                    const ggml_tensor * sw_gate = src1_swiglu->src[0];
+                    const ggml_tensor * sw_up   = src1_swiglu->src[1];
+                    const bool use_aligned_float8 = ggml_cuda_is_aligned(sw_gate, align_float8) && ggml_cuda_is_aligned(sw_up, align_float8);
+                    quantize_mmq_nvfp4_swiglu_cuda((const float *) sw_gate->data, (const float *) sw_up->data, src1_q8_1, src1_scale,
+                                                   use_aligned_float8, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                } else {
+                    const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
+                    quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1, src1_scale, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                                            ne11, ne12, ne13, stream);
+                }
 
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
@@ -580,6 +593,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+}
+
+bool ggml_cuda_mmq_src1_native_fp4(const ggml_tensor * mm, const int cc) {
+    return ggml_cuda_mmq_get_prec_src1(mm->src[0], mm, cc) == GGML_PREC_Q4;
 }
 
 bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int64_t nchannels, const int device) {

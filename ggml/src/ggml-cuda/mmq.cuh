@@ -1662,3 +1662,6 @@ void ggml_cuda_mul_mat_q(
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
 bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
+
+// Whether a dense MMQ matmul (mm) quantizes src1 to native FP4 rather than Q8_1 on this device.
+bool ggml_cuda_mmq_src1_native_fp4(const ggml_tensor * mm, int cc);

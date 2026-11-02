@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -123,13 +124,26 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     return static_cast<uint8_t>(biased);
 }
 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+// silu(gate) * up, the same expression as the SWIGLU kernel so a fused quantization reads the same values
+static __device__ __forceinline__ float8 nvfp4_swiglu8(const float8 g, const float8 u) {
+    return float8{
+        ggml_cuda_op_silu_single(g.x) * u.x, ggml_cuda_op_silu_single(g.y) * u.y,
+        ggml_cuda_op_silu_single(g.z) * u.z, ggml_cuda_op_silu_single(g.w) * u.w,
+        ggml_cuda_op_silu_single(g.p) * u.p, ggml_cuda_op_silu_single(g.q) * u.q,
+        ggml_cuda_op_silu_single(g.r) * u.r, ggml_cuda_op_silu_single(g.s) * u.s};
+}
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <bool scatter, bool use_aligned_float8>
-static __global__ void quantize_mmq_nvfp4(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy, float * __restrict__ scale,
+// swiglu: x is the gate and x_up the up projection (same layout); quantize silu(x) * x_up
+template <bool scatter, bool use_aligned_float8, bool swiglu, int nthreads = CUDA_QUANTIZE_BLOCK_SIZE_MMQ>
+static __global__ void __launch_bounds__(nthreads) quantize_mmq_nvfp4(
+        const float * __restrict__ x, const float * __restrict__ x_up, const int32_t * __restrict__ ids, void * __restrict__ vy, float * __restrict__ scale,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int n_expert_used) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
+    static_assert(!(scatter && swiglu), "the scatter path does not take a SWIGLU input");
 
     int64_t base_idx;
     if constexpr (scatter) {
@@ -140,13 +154,17 @@ static __global__ void quantize_mmq_nvfp4(
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
         base_idx = i3 * s03 + i2 * s02 + i01 * s01;
     }
-    const float * __restrict__  x_row = x + base_idx;
+    const float * __restrict__  x_row  = x + base_idx;
+    const float * __restrict__  up_row = swiglu ? x_up + base_idx : nullptr;
 
     float amax = 0.0f;
     if constexpr (use_aligned_float8) {
         for (int64_t i0 = 8 * threadIdx.x; i0 < ne00; i0 += 8 * blockDim.x) {
             const float * x_base = x_row + i0;
-            const float8 v = reinterpret_cast<const float8 *>(x_base)[0];
+            float8 v = reinterpret_cast<const float8 *>(x_base)[0];
+            if constexpr (swiglu) {
+                v = nvfp4_swiglu8(v, reinterpret_cast<const float8 *>(up_row + i0)[0]);
+            }
             amax = fmaxf(amax, fabsf(v.x));
             amax = fmaxf(amax, fabsf(v.y));
             amax = fmaxf(amax, fabsf(v.z));
@@ -158,13 +176,14 @@ static __global__ void quantize_mmq_nvfp4(
         }
     } else {
         for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += blockDim.x) {
-            amax = fmaxf(amax, fabsf(x_row[i0]));
+            const float v = swiglu ? ggml_cuda_op_silu_single(x_row[i0]) * up_row[i0] : x_row[i0];
+            amax = fmaxf(amax, fabsf(v));
         }
     }
 
     amax = warp_reduce_max<WARP_SIZE>(amax);
 
-    __shared__ float warp_amax[CUDA_QUANTIZE_BLOCK_SIZE_MMQ / WARP_SIZE];
+    __shared__ float warp_amax[nthreads / WARP_SIZE];
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
 
@@ -174,7 +193,7 @@ static __global__ void quantize_mmq_nvfp4(
     __syncthreads();
 
     if (warp == 0) {
-        amax = threadIdx.x < int(CUDA_QUANTIZE_BLOCK_SIZE_MMQ / WARP_SIZE) ? warp_amax[lane] : 0.0f;
+        amax = threadIdx.x < int(nthreads / WARP_SIZE) ? warp_amax[lane] : 0.0f;
         amax = warp_reduce_max<WARP_SIZE>(amax);
         if (lane == 0) {
             warp_amax[0] = amax / (6.0f * 448.0f);
@@ -204,9 +223,15 @@ static __global__ void quantize_mmq_nvfp4(
 
         float vals[QK_NVFP4_SUB];
         if constexpr (use_aligned_float8) {
+            const float8 zero8 = float8{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
             const float * x_base = x_row + i0_base;
-            const float8 v0 = i0_base +  7 < ne00 ? reinterpret_cast<const float8 *>(x_base)[0]     : float8{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-            const float8 v1 = i0_base + 15 < ne00 ? reinterpret_cast<const float8 *>(x_base + 8)[0] : float8{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            float8 v0 = i0_base +  7 < ne00 ? reinterpret_cast<const float8 *>(x_base)[0]     : zero8;
+            float8 v1 = i0_base + 15 < ne00 ? reinterpret_cast<const float8 *>(x_base + 8)[0] : zero8;
+            if constexpr (swiglu) {
+                const float * up_base = up_row + i0_base;
+                v0 = nvfp4_swiglu8(v0, i0_base +  7 < ne00 ? reinterpret_cast<const float8 *>(up_base)[0]     : zero8);
+                v1 = nvfp4_swiglu8(v1, i0_base + 15 < ne00 ? reinterpret_cast<const float8 *>(up_base + 8)[0] : zero8);
+            }
             vals[0] = v0.x; vals[1] = v0.y; vals[2] = v0.z; vals[3] = v0.w;
             vals[4] = v0.p; vals[5] = v0.q; vals[6] = v0.r; vals[7] = v0.s;
             vals[8] = v1.x; vals[9] = v1.y; vals[10] = v1.z; vals[11] = v1.w;
@@ -215,7 +240,11 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
             for (int k = 0; k < QK_NVFP4_SUB; ++k) {
                 const int64_t i00 = i0_base + k;
-                vals[k] = i00 < ne00 ? x_row[i00] : 0.0f;
+                if constexpr (swiglu) {
+                    vals[k] = i00 < ne00 ? ggml_cuda_op_silu_single(x_row[i00]) * up_row[i00] : 0.0f;
+                } else {
+                    vals[k] = i00 < ne00 ? x_row[i00] : 0.0f;
+                }
             }
         }
 
@@ -324,7 +353,7 @@ static __global__ void quantize_mmq_nvfp4(
         }
     }
 #else
-    GGML_UNUSED_VARS(x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used);
+    GGML_UNUSED_VARS(x, x_up, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used);
     NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
@@ -641,11 +670,11 @@ void quantize_scatter_mmq_fp4_cuda(
         const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
         const dim3 num_blocks(n_tokens, 1, 1);
         if (use_aligned_float8) {
-            quantize_mmq_nvfp4<true, true><<<num_blocks, block_size, 0, stream>>>(
-                x, ids_src1_inv, vy, scale, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
+            quantize_mmq_nvfp4<true, true, false><<<num_blocks, block_size, 0, stream>>>(
+                x, nullptr, ids_src1_inv, vy, scale, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
         } else {
-            quantize_mmq_nvfp4<true, false><<<num_blocks, block_size, 0, stream>>>(
-                x, ids_src1_inv, vy, scale, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
+            quantize_mmq_nvfp4<true, false, false><<<num_blocks, block_size, 0, stream>>>(
+                x, nullptr, ids_src1_inv, vy, scale, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/nrows_dst, /*ne2=*/1, n_expert_used);
         }
     } else {
         GGML_ASSERT(type_src0 == GGML_TYPE_MXFP4);
@@ -672,11 +701,11 @@ void quantize_mmq_fp4_cuda(
         const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
         const dim3 num_blocks(ne1, ne2 * ne3, 1);
         if (use_aligned_float8) {
-            quantize_mmq_nvfp4<false, true><<<num_blocks, block_size, 0, stream>>>(
-                x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            quantize_mmq_nvfp4<false, true, false><<<num_blocks, block_size, 0, stream>>>(
+                x, nullptr, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
         } else {
-            quantize_mmq_nvfp4<false, false><<<num_blocks, block_size, 0, stream>>>(
-                x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            quantize_mmq_nvfp4<false, false, false><<<num_blocks, block_size, 0, stream>>>(
+                x, nullptr, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
         }
     } else {
         GGML_ASSERT(ne0 % (2 * QK_MXFP4) == 0);
@@ -690,5 +719,25 @@ void quantize_mmq_fp4_cuda(
         const dim3    block_size(WARP_SIZE, nwarps, 1);
 
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+    }
+}
+
+void quantize_mmq_nvfp4_swiglu_cuda(
+        const float * gate, const float * up, void * vy, float * scale, const bool use_aligned_float8,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(scale);
+    GGML_ASSERT(ne0 > 0);
+    GGML_ASSERT(ne00 % QK_NVFP4 == 0);
+    // FFN-wide rows that each read two inputs and evaluate silu twice: 128 threads per row leave the
+    // kernel latency-bound (+9% Qwen3.8-27B prefill at 512 threads, no change at 1024)
+    constexpr int nthreads = 512;
+    const dim3 num_blocks(ne1, ne2 * ne3, 1);
+    if (use_aligned_float8) {
+        quantize_mmq_nvfp4<false, true, true, nthreads><<<num_blocks, nthreads, 0, stream>>>(
+            gate, up, nullptr, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+    } else {
+        quantize_mmq_nvfp4<false, false, true, nthreads><<<num_blocks, nthreads, 0, stream>>>(
+            gate, up, nullptr, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
 }
