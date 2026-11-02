@@ -745,6 +745,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    mmq_src1_cache.release();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -4915,6 +4917,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    for (int j = i; j <= i + nodes_to_skip; ++j) {
+                        const ggml_tensor * written = cgraph->nodes[j];
+                        if (cuda_ctx->mmq_src1_cache.overlaps(written->data, ggml_nbytes(written))) {
+                            cuda_ctx->mmq_src1_cache.release();
+                        }
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4941,10 +4949,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                if (cuda_ctx->mmq_src1_cache.overlaps(node->data, ggml_nbytes(node))) {
+                    cuda_ctx->mmq_src1_cache.release();
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
             }
+
+            // the next graph's allocator reuses every address, so nothing quantized survives it
+            cuda_ctx->mmq_src1_cache.release();
         }
 
 #ifdef USE_CUDA_GRAPH

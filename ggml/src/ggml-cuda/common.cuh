@@ -1452,6 +1452,58 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// src1 of an MMQ matmul, quantized, kept for the next matmul that reads the same activations.
+// Projections that share an input (Q/K/V, gate/up, the GDN in_proj group) used to re-quantize it
+// once each. The entry is keyed on src1's address, shape, strides and the quantized format, and is
+// released as soon as any executed node writes over src1's bytes (the graph allocator only reuses
+// that memory once the tensor is dead) and at the end of every graph. It owns two pool allocations
+// that stay on top of the pool's stack until released, which is what the VMM pool requires.
+struct ggml_cuda_mmq_src1_cache {
+    ggml_cuda_pool * pool = nullptr;
+    const void *     src1 = nullptr;
+    size_t           src1_nbytes = 0;
+    int64_t          ne[GGML_MAX_DIMS] = {};
+    size_t           nb[GGML_MAX_DIMS] = {};
+    int              format = -1;
+
+    char *  q          = nullptr;
+    size_t  q_size     = 0;
+    float * scale      = nullptr;
+    size_t  scale_size = 0;
+    size_t  scale_n    = 0;
+
+    bool matches(const ggml_tensor * t, int fmt, size_t q_needed, size_t scale_needed) const {
+        if (q == nullptr || t->data != src1 || fmt != format || q_size < q_needed || scale_n != scale_needed) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (t->ne[i] != ne[i] || t->nb[i] != nb[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool overlaps(const void * data, size_t nbytes) const {
+        if (q == nullptr || data == nullptr) {
+            return false;
+        }
+        const char * a = (const char *) src1;
+        const char * b = (const char *) data;
+        return b < a + src1_nbytes && a < b + nbytes;
+    }
+
+    void release() {
+        if (scale != nullptr) {
+            pool->free(scale, scale_size);
+        }
+        if (q != nullptr) {
+            pool->free(q, q_size);
+        }
+        *this = ggml_cuda_mmq_src1_cache();
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1463,6 +1515,8 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    ggml_cuda_mmq_src1_cache mmq_src1_cache;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
