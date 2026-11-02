@@ -409,7 +409,9 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC client-side implementation
 
-// with busy spinning on, the dispatcher still blocks on its queue after this long without commands
+// The dispatcher and a caller waiting on it spin while commands keep coming, and block after this
+// long without one. Each command is two thread handoffs (caller -> dispatcher -> caller); woken from
+// a sleep they cost about as much as the network round trip they wrap.
 static constexpr auto RPC_BUSY_SPIN_IDLE_TIME = std::chrono::milliseconds(100);
 
 static inline void rpc_cpu_relax() {
@@ -418,6 +420,19 @@ static inline void rpc_cpu_relax() {
 #else
     std::this_thread::yield();
 #endif
+}
+
+// wait for the dispatcher, spinning for up to RPC_BUSY_SPIN_IDLE_TIME before blocking
+template <typename future_t>
+static void rpc_wait_spin(future_t & future) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        if (std::chrono::steady_clock::now() - t0 >= RPC_BUSY_SPIN_IDLE_TIME) {
+            future.wait();
+            return;
+        }
+        rpc_cpu_relax();
+    }
 }
 
 // Performs HELLO handshake with transport auto-negotiation.
@@ -509,8 +524,6 @@ public:
     void event_synchronize(ggml_backend_event_t event);
     void event_record(ggml_backend_event_t event);
     void synchronize();
-    void busy_spin_acquire();
-    void busy_spin_release();
     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
 
     void start(const std::string & endpoint);
@@ -537,7 +550,6 @@ private:
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
     rpc_msg_queue    queue;
     socket_ptr       sock;
-    std::atomic_uint busy_spin_users = 0;
     std::atomic_bool running;
     std::thread      thread;
 };
@@ -556,7 +568,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->output_size = 0;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
-    future.wait();
+    rpc_wait_spin(future);
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
@@ -578,7 +590,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->output_size = output_size;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
-    future.wait();
+    rpc_wait_spin(future);
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
@@ -610,7 +622,7 @@ void rpc_dispatcher::event_free(ggml_backend_event_t event) {
 
 void rpc_dispatcher::event_synchronize(ggml_backend_event_t event) {
     rpc_event * ev = (rpc_event *)event->context;
-    ev->sf.wait();
+    rpc_wait_spin(ev->sf);
 }
 
 void rpc_dispatcher::event_record(ggml_backend_event_t event) {
@@ -626,16 +638,8 @@ void rpc_dispatcher::synchronize() {
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = RPC_CMD_NONE;
     GGML_ASSERT(queue.push(msg));
-    msg->completion.get_future().wait();
-}
-
-void rpc_dispatcher::busy_spin_acquire() {
-    busy_spin_users.fetch_add(1, std::memory_order_relaxed);
-}
-
-void rpc_dispatcher::busy_spin_release() {
-    const unsigned previous = busy_spin_users.fetch_sub(1, std::memory_order_relaxed);
-    GGML_ASSERT(previous > 0);
+    auto future = msg->completion.get_future();
+    rpc_wait_spin(future);
 }
 
 void rpc_dispatcher::start(const std::string & endpoint) {
@@ -665,8 +669,7 @@ void rpc_dispatcher::work() {
     while (running) {
         rpc_msg_ptr msg_ptr;
         // spin only while commands keep coming, so an idle dispatcher does not keep a core busy
-        const bool spin = busy_spin_users.load(std::memory_order_relaxed) != 0 &&
-                          std::chrono::steady_clock::now() - last_cmd < RPC_BUSY_SPIN_IDLE_TIME;
+        const bool spin = std::chrono::steady_clock::now() - last_cmd < RPC_BUSY_SPIN_IDLE_TIME;
         if (spin) {
             if (!queue.try_pop(&msg_ptr)) {
                 rpc_cpu_relax();
@@ -2991,7 +2994,6 @@ static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
         auto request = std::make_shared<rpc_msg_comm_free_req>();
         request->device = rank.device;
         rank.dispatcher->send(RPC_CMD_COMM_FREE, request, sizeof(*request));
-        rank.dispatcher->busy_spin_release();
     }
     delete comm_ctx;
 }
@@ -3031,10 +3033,6 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         return nullptr;
     }
 
-    for (const auto & rank : ranks) {
-        rank.dispatcher->busy_spin_acquire();
-    }
-
     // Send all init requests before reading any response: rank 0 blocks in accept
     // until rank 1 has connected.
     std::vector<rpc_msg_comm_init_rsp> responses(n_backends);
@@ -3060,9 +3058,6 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
     }
     if (!ok) {
-        for (const auto & rank : ranks) {
-            rank.dispatcher->busy_spin_release();
-        }
         return nullptr;
     }
     LOG_INFO("%s: pairwise communicator initialized (%s <-> %s)\n", __func__,
