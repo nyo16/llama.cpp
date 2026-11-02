@@ -436,6 +436,27 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // a context that shares tensors with ctx_other (e.g. the target's token embeddings and lm head
+        // for a DFlash/EAGLE3 draft) computes with them, so it needs a backend for every device of the
+        // other model too - otherwise a draft placed on fewer devices than its target aborts in the
+        // scheduler with "pre-allocated tensor ... in a buffer ... that cannot run the operation"
+        if (cparams.ctx_other != nullptr) {
+            const llama_model & model_other = cparams.ctx_other->get_model();
+            for (const auto & dev_other : model_other.devices) {
+                const bool present = std::any_of(model.devices.begin(), model.devices.end(),
+                        [&](const llama_device & dev) { return dev.dev == dev_other.dev; });
+                if (present) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev_other.dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev_other.dev)));
+                }
+                LLAMA_LOG_INFO("%s: adding %s backend for tensors shared with ctx_other\n", __func__, ggml_backend_dev_name(dev_other.dev));
+                backends.emplace_back(backend);
+            }
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
